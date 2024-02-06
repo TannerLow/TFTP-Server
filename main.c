@@ -80,7 +80,7 @@ int createAndBindSocket(const addrinfo * hints, const char* host, const char* po
 int getFreeStateTableEntry(StateTable* stateTable);
 TFTPPacket parseTFTPPacket(const char* rawData, const size_t dataLength);
 void deleteTFTPPacket(TFTPPacket* packet); // safely delete packet created from parseTFTPPacket
-bool getFileDescriptor(char** filename, FileTable* fileTable);
+int getFileDescriptor(char** filename, FileTable* fileTable);
 char* serializeTFTPDataPacket(TFTPPacket* packet);
 
 int main() {
@@ -219,7 +219,7 @@ int main() {
             }
             TFTPPacket packet = parseTFTPPacket(inBuffer, bytesReceived);
 
-            if (packet.opcode == -1) {
+            if (packet.opcode == (unsigned short)-1) {
                 // handle this
                 close(entrySocketDescriptor);
                 close(replySocketDescriptor);
@@ -426,7 +426,7 @@ TFTPPacket parseTFTPPacket(const char* rawData, const size_t rawDataLength) {
         // Parse data
         if(rawDataLength - dataParsed > 0) {
             size_t dataLength = rawDataLength - dataParsed;
-            packet.data = (char*)malloc(dataLength);
+            //packet.data = (char*)malloc(dataLength);
             memcpy(packet.data, rawData + dataParsed, dataLength);
             packet.dataLength = dataLength;
             dataParsed += dataLength;
@@ -457,12 +457,12 @@ void deleteTFTPPacket(TFTPPacket* packet) {
         return;
     }
 
-    if(opcode == 1 || opcode == 2) {
+    if(packet->opcode == 1 || packet->opcode == 2) {
         free(packet->filename); // Might cause issue, fingers are crossed
         free(packet->mode);
     }
-    else if(opcode == 3) {
-        free(packet->data);
+    else if(packet->opcode == 3) {
+        //free(packet->data);
     }
 }
 
@@ -505,11 +505,11 @@ int getFileDescriptor(char** filename, FileTable* fileTable) {
         
         // if we didn't find any free slots then expand the array
         if(index == -1) {
-            index = fileTable.size;
-            fileTable.size++;
+            index = fileTable->size;
+            fileTable->size++;
         }
 
-        fileTable.files[index] = addFileInfo;
+        fileTable->files[index] = addFileInfo;
     }
     return 0;
 }
