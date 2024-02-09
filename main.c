@@ -110,20 +110,24 @@ int main() {
     replySocketDescriptor = createAndBindSocket(&hints, NULL, OUTGOING_PORT);
     printf("Successfully created outSocket\n");
 
+    fd_set readfdsMaster;
     fd_set readfds;
-    fd_set writefds;
     int maxfds = (entrySocketDescriptor > replySocketDescriptor) ? entrySocketDescriptor : replySocketDescriptor;
 
+    FD_ZERO(&readfdsMaster);
     FD_ZERO(&readfds);
-    FD_SET(entrySocketDescriptor, &readfds);
-    FD_SET(replySocketDescriptor, &readfds);
+    FD_SET(entrySocketDescriptor, &readfdsMaster);
+    FD_SET(replySocketDescriptor, &readfdsMaster);
 
     char inBuffer[MAX_IN_BUFFER_SIZE];
     memset(inBuffer, 0, MAX_IN_BUFFER_SIZE);
 
     // main loop
     for(;;) {
+        readfds = readfdsMaster;
+        printf("Listening for requests/acks\n");
         int returnCode = select(maxfds+1, &readfds, NULL, NULL, NULL);
+        printf("select returned\n");
         if(returnCode == -1) {
             perror("select");
             close(entrySocketDescriptor);
@@ -132,17 +136,20 @@ int main() {
         }
 
         sockaddr_storage from;
-        socklen_t addressSize;
-        unsigned int flags = 0;
+        socklen_t addressSize = sizeof(from);
+	unsigned int flags = 0;
         // Port 69 has available data meaning a new request
         if(FD_ISSET(entrySocketDescriptor, &readfds)) {
             int bytesReceived = recvfrom(entrySocketDescriptor, inBuffer, MAX_IN_BUFFER_SIZE-1, flags, (sockaddr*)&from, &addressSize);
+            printf("recvfrom returned\n");
             if(bytesReceived == -1) {
                 perror("recvfrom");
                 close(entrySocketDescriptor);
                 close(replySocketDescriptor);
                 exit(RECVFROM_FAILURE);
             }
+            printf("addressSize: %d\n", addressSize);
+            printf("sizeof(from): %d\n", sizeof(from));
             inBuffer[bytesReceived] = '\0'; // end with null for string parsing safety
 
             int stateTableEntryIndex = getFreeStateTableEntry(&stateTable);
@@ -175,7 +182,9 @@ int main() {
             response.opcode = 3;
             response.block = entry.block;
 
+            printf("Attempting to get file descriptor\n");
             int file = getFileDescriptor(&entry.filename, &fileTable);
+            printf("Got file descriptor: %d\n", file);
 
             FileInfo fileinfo;
             fileinfo.filename = entry.filename;
@@ -192,9 +201,15 @@ int main() {
                 exit(PREAD_FAILURE);
             }
 
-	        response.dataLength = bytesPread;
+	    response.dataLength = bytesPread;
             
             void* serializedResponse = serializeTFTPDataPacket(&response);
+            printf("addressSize: %d\n", addressSize);
+            printf("serializedResponse: %p\n", serializedResponse);
+            printf("buffer size: %d\n", bytesPread + 4);
+            sockaddr_in* temp = (sockaddr_in*)&from;
+            printf("ip port: %d %d\n", temp->sin_addr.s_addr, temp->sin_port);
+
             int bytesSent = sendto(replySocketDescriptor, serializedResponse, bytesPread + 4, flags, (sockaddr*)&from, addressSize);
             //  TODO Need to something about partial sends, consult with RFC 1350 spec
             if (bytesSent == -1) {
@@ -208,9 +223,11 @@ int main() {
         
         // Port 42069 has available data meaning an acknowledgement of data receipt
         if(FD_ISSET(replySocketDescriptor, &readfds)) {
-            // TODO implement reply to existing client
-	        memset(inBuffer, 0, sizeof(inBuffer));
+            addressSize = sizeof(from);
+            printf("replySocket is read-to-read\n");
+	    memset(inBuffer, 0, sizeof(inBuffer));
             int bytesReceived = recvfrom(replySocketDescriptor, inBuffer, MAX_IN_BUFFER_SIZE-1, flags, (sockaddr*)&from, &addressSize);
+            printf("replySocket recvfrom returned, bytes received: %d\n", bytesReceived);
             if(bytesReceived == -1) {
                 perror("recvfrom");
                 close(entrySocketDescriptor);
@@ -219,6 +236,7 @@ int main() {
             }
             TFTPPacket packet = parseTFTPPacket(inBuffer, bytesReceived);
 
+            printf("packet opcode: %u\n", packet.opcode);
             if (packet.opcode == (unsigned short)-1) {
                 // handle this
                 close(entrySocketDescriptor);
@@ -235,9 +253,13 @@ int main() {
             
             // Search for client in the state table
             StateTableEntry* currentEntry = NULL;
+            printf("size of state table: %d\n", stateTable.size);
             for(int i = 0; i < stateTable.size; ++i) {
                 currentEntry = &stateTable.entries[i];
                 // blame Jackson
+                printf("comp a: %d\n", ((sockaddr_in*)&(currentEntry->addressInfo))->sin_addr.s_addr);
+                printf("comp b: %d\n", ((sockaddr_in*)&from)->sin_addr.s_addr);
+                printf("block comparison: %d vs. %d\n", currentEntry->block, packet.block);
                 if(((sockaddr_in *) &(currentEntry->addressInfo))->sin_addr.s_addr == ((sockaddr_in *) &from)->sin_addr.s_addr && currentEntry->block == packet.block) {
                     break;
                 }
@@ -246,6 +268,7 @@ int main() {
 
             // Client was acknowledeing something but we don't know the client
             if (!currentEntry) {
+                printf("Ack from unknown\n");
                 // handle this :)
                 close(entrySocketDescriptor);
                 close(replySocketDescriptor);
@@ -256,16 +279,18 @@ int main() {
             TFTPPacket response;
             response.opcode = 3;
             response.block = currentEntry->block;
-            
+            printf("Attempting to get file descriptor\n"); 
+            int file = getFileDescriptor(&currentEntry->filename, &fileTable);
+            printf("Got file descriptor: %d\n", file);
             // Keep track of an empty spot
-            int file = -1;
+            /*int file = -1;
             for (int i = 0; i < fileTable.size; ++i) {
                 FileInfo currentFileInfo = fileTable.files[i]; 
                 if (strcmp(currentFileInfo.filename, currentEntry->filename)) {
                     file = currentFileInfo.file;
                     break;
                 }
-            }
+            }*/
             
             if (file == -1) {
                 // fail if file got moved or something
@@ -278,7 +303,9 @@ int main() {
 
             int bytesPread = 0; 
             memset(response.data, 0, MAX_FILE_DATA);
-	        off_t offset = packet.block++ * MAX_FILE_DATA;
+	    off_t offset = currentEntry->block++ * MAX_FILE_DATA;
+            response.block = currentEntry->block;
+            printf("Preading\n");
             bytesPread = pread(file, response.data, MAX_FILE_DATA, offset);
             if (bytesPread == -1) {
 		        fprintf(stdout, "cringe!%s\r\n", response.data);
@@ -303,7 +330,7 @@ int main() {
 
             free(serializedResponse);
 
-	        currentEntry->block = packet.block;
+	    //currentEntry->block = packet.block;
             currentEntry->lastInteraction = time(NULL);
         }
     }
@@ -378,6 +405,14 @@ int getFreeStateTableEntry(StateTable* stateTable) {
     return -1;
 }
 
+uint16_t reverseBytesShort(uint16_t s) {
+    uint16_t temp = s;
+    s <<= 8;
+    s -= 0xFF00;
+    s |= (temp >> 8) & 0xFF;
+    return s;
+}
+
 TFTPPacket parseTFTPPacket(const char* rawData, const size_t rawDataLength) {
     // For TFTP protocol breakdown see RFC 1350: https://datatracker.ietf.org/doc/html/rfc1350.html
     
@@ -389,6 +424,7 @@ TFTPPacket parseTFTPPacket(const char* rawData, const size_t rawDataLength) {
     if(rawDataLength >= dataParsed + 2) {
         uint16_t* opcodePointer = (uint16_t*)rawData;
         uint16_t opcode = *opcodePointer;
+        //packet.opcode = reverseBytesShort(ntohs(opcode));
         packet.opcode = ntohs(opcode);
         dataParsed += 2;
     }
@@ -417,9 +453,10 @@ TFTPPacket parseTFTPPacket(const char* rawData, const size_t rawDataLength) {
     // opcode 3: data packet -> opcode(2) block#(2) data(n)
     else if(packet.opcode == 3) {
         // Parse block#
-        if(rawDataLength >= dataParsed + 1) {
-            uint16_t* blockPointer = (uint16_t*)rawData;
+        if(rawDataLength >= dataParsed + 2) {
+            uint16_t* blockPointer = (uint16_t*)(rawData + 2);
             uint16_t block = *blockPointer;
+            //packet.block = reverseBytesShort(ntohs(block));
             packet.block = ntohs(block);
             dataParsed += 2;
         }
@@ -435,9 +472,10 @@ TFTPPacket parseTFTPPacket(const char* rawData, const size_t rawDataLength) {
     // opcode 4: ack packet -> opcode(2) block#(2)
     else if(packet.opcode == 4) {
         // Parse block#
-        if(rawDataLength >= dataParsed + 1) {
-            uint16_t* blockPointer = (uint16_t*)rawData;
+        if(rawDataLength >= dataParsed + 2) {
+            uint16_t* blockPointer = (uint16_t*)(rawData + 2);
             uint16_t block = *blockPointer;
+            //packet.block = reverseBytesShort(ntohs(block));
             packet.block = ntohs(block);
             dataParsed += 2;
         }
@@ -485,6 +523,7 @@ int getFileDescriptor(char** filename, FileTable* fileTable) {
             break;
         }
     }
+    printf("in getFileDescriptor, index, file: %d %d\n", index, file);
 
     if (file == -1) {
         // need to ensure we close this eventually
@@ -511,7 +550,7 @@ int getFileDescriptor(char** filename, FileTable* fileTable) {
 
         fileTable->files[index] = addFileInfo;
     }
-    return 0;
+    return file;
 }
 
 char* serializeTFTPDataPacket(TFTPPacket* packet) {
