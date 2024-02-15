@@ -94,6 +94,7 @@ char* serializeTFTPPacket(TFTPPacket* packet, size_t* byteCount);
 TFTPPacket createErrorPacket(unsigned short errorCode, char* errorMessage);
 void _crash(int errorCode, const char* erroredFunction, int* socketDescriptors, int socketDescriptorCount, FileTable* fileTable, const char* file, int line);
 int sendErrorPacket(unsigned short errorCode, char* errorMessage, int socket, sockaddr* recipient, socklen_t addressSize);
+void removeStateTableEntry(StateTableEntry* stateTable);
 
 #define crash(errorCode, erroredFunction, socketDescriptors, socketDescriptorCount, fileTable) \
     _crash(errorCode, erroredFunction, socketDescriptors, socketDescriptorCount, fileTable, __FILE__, __LINE__)
@@ -288,6 +289,29 @@ int main() {
                 crash(UNEXPECTED_OPCODE, NULL, socketDescriptors, socketDescriptorCount, &fileTable);
             }
 
+            if(packet.opcode == 5) {
+                // TODO remove client from state table
+                printf("Client sent Error packet\n");
+                StateTableEntry* currentEntry = NULL;
+                for(int i = 0; i < stateTable.size; ++i) {
+                    currentEntry = &stateTable.entries[i];
+                    // printf("comp a: %d\n", ((sockaddr_in*)&(currentEntry->addressInfo))->sin_addr.s_addr);
+                    // printf("comp b: %d\n", ((sockaddr_in*)&from)->sin_addr.s_addr);
+                    // printf("block comparison: %d vs. %d\n", currentEntry->block, packet.block);
+                    // blame Jackson
+                    if(((sockaddr_in *) &(currentEntry->addressInfo))->sin_addr.s_addr == ((sockaddr_in *) &from)->sin_addr.s_addr && currentEntry->block == packet.block) {
+                        printf("Found matching entry, filename, mode: %s, %s\n", currentEntry->filename, currentEntry->mode);
+                        break;
+                    }
+                    currentEntry = NULL;
+                }
+                
+                if(currentEntry == NULL) {
+                    removeStateTableEntry(currentEntry);
+                }
+                break;
+            }
+
             if (packet.opcode != 4) {
                 printf("ReplySocket received with opcode other than 4\n");
                 // Send out an error packet and crash
@@ -445,7 +469,15 @@ int getFreeStateTableEntry(StateTable* stateTable) {
     // Vanquish anyone who has timed out
     time_t currentTime = time(NULL);
     for(int i = 0; i < stateTable->size; i++) {
-        if(currentTime - stateTable->entries[i].lastInteraction >= TIMEOUT_DURATION) {
+        StateTableEntry* entry = &stateTable->entries[i];
+        if(currentTime - entry->lastInteraction >= TIMEOUT_DURATION) {
+            entry->block = 0;
+            entry->filename = NULL;
+            if(entry->mode == NULL) {
+                free(entry->mode);
+                entry->mode = NULL;
+            }
+
             return i;
         }
     }
@@ -458,13 +490,13 @@ int getFreeStateTableEntry(StateTable* stateTable) {
     return -1;
 }
 
-uint16_t reverseBytesShort(uint16_t s) {
-    uint16_t temp = s;
-    s <<= 8;
-    s -= 0xFF00;
-    s |= (temp >> 8) & 0xFF;
-    return s;
-}
+// uint16_t reverseBytesShort(uint16_t s) {
+//     uint16_t temp = s;
+//     s <<= 8;
+//     s -= 0xFF00;
+//     s |= (temp >> 8) & 0xFF;
+//     return s;
+// }
 
 TFTPPacket parseTFTPPacket(const char* rawData, const size_t rawDataLength) {
     // For TFTP protocol breakdown see RFC 1350: https://datatracker.ietf.org/doc/html/rfc1350.html
@@ -528,13 +560,26 @@ TFTPPacket parseTFTPPacket(const char* rawData, const size_t rawDataLength) {
         if(rawDataLength >= dataParsed + 2) {
             uint16_t* blockPointer = (uint16_t*)(rawData + 2);
             uint16_t block = *blockPointer;
-            //packet.block = reverseBytesShort(ntohs(block));
             packet.block = ntohs(block);
             dataParsed += 2;
         }
     }
+    // opcode 5: error packet -> opcode(2) errorCode(2) ErrMsg(n) null
     else if(packet.opcode == 5) {
-        // TODO implement error packet parsing
+        // parse error code
+        if(rawDataLength >= dataParsed + 2) {
+            uint16_t* errorCodePointer = (uint16_t*)(rawData + 2);
+            uint16_t errorCode = *errorCodePointer;
+            packet.errorCode = ntohs(errorCode);
+            dataParsed += 2;
+        }
+        // Parse error message
+        if(rawDataLength - dataParsed > 0) {
+            size_t dataLength = rawDataLength - dataParsed;
+            packet.errorMessage = (char*)malloc(dataLength);
+            memcpy(packet.errorMessage, rawData + dataParsed, dataLength);
+            dataParsed += dataLength;
+        }
     }
     else {
         // TODO error out due to invalid packet
@@ -556,6 +601,11 @@ void deleteTFTPPacket(TFTPPacket* packet) {
     else if(packet->opcode == 3) {
         //free(packet->data);
     }
+    else if(packet->opcode == 5) {
+        if(packet->errorMessage != NULL) {
+            free(packet->errorMessage);
+        }
+    }
 }
 
 int getFileDescriptor(char* filename, FileTable* fileTable) {
@@ -565,21 +615,33 @@ int getFileDescriptor(char* filename, FileTable* fileTable) {
     for(int i = 0; i < fileTable->size; i++) {
         printf("FileInfo: %d %s\n", fileTable->files[i].file, fileTable->files[i].filename);
     }
+
+    time_t currentTime = time(NULL);
+
     int file = -1;
     int index = -1;
     for(int i = 0; i < fileTable->size; i++) {
-        FileInfo currentFileInfo = fileTable->files[i]; 
+        FileInfo currentFileInfo = fileTable->files[i];
+        time_t timeSinceUse = currentTime - currentFileInfo.lastInteraction;
 
         // check if we already have the file
-	    if(strcmp(currentFileInfo.filename, filename) == 0) {
+	    if((file == -1) && strcmp(currentFileInfo.filename, filename) == 0) {
             file = currentFileInfo.file;
-            break;
         }
 
         // check if the slot is free
-        if(currentFileInfo.filename == NULL) {
+        if((index == -1) && (currentFileInfo.filename == NULL)) {
             index = i;
-            break;
+        }
+
+        if(timeSinceUse > 60) {
+            if(currentFileInfo.file > 0) {
+                close(currentFileInfo.file);
+            }
+            if(currentFileInfo.filename != NULL) {
+                free(currentFileInfo.filename);
+            }
+            memset(fileTable->files + i, 0, sizeof(FileInfo));
         }
     }
     printf("in getFileDescriptor, index, file: %d %d\n", index, file);
@@ -588,6 +650,9 @@ int getFileDescriptor(char* filename, FileTable* fileTable) {
         // need to ensure we close this eventually
         // TODO handle case where file doesn't open (ex. file not found)
         file = open(filename, O_RDONLY, 0777);
+        if(file == -1) {
+            perror("open");
+        }
         
         // stick in table
         FileInfo addFileInfo;
@@ -671,4 +736,12 @@ int sendErrorPacket(unsigned short errorCode, char* errorMessage, int socket, so
     void* serializedPacket = serializeTFTPPacket(&errorPacket, &packetByteCount);
     int flags = 0;
     return sendto(socket, serializedPacket, packetByteCount, flags, recipient, addressSize);
+}
+
+void removeStateTableEntry(StateTableEntry* stateTableEntry) {
+    if(stateTableEntry == NULL) {
+        return;
+    }
+
+    stateTableEntry->lastInteraction = 0;
 }
